@@ -1,6 +1,8 @@
 // screenpipe — AI that knows everything you've seen, said, or heard
 // https://screenpipe.com
 
+import { getHostedAiAllowedModels } from '../../src/services/hosted-ai-policy';
+
 // Deliberately outside the Worker import graph. These tools prepare and test a
 // destination account; they do not select a production route or assign a plan.
 export const EXPERIENTIAL_ORIGIN = 'https://api.experientiallabs.ai';
@@ -9,6 +11,10 @@ type Json = Record<string, any>;
 export type ProbeProtocol = 'chat' | 'stream' | 'tools' | 'json-schema' | 'responses' | 'messages';
 const KEY = /^xpl_[0-9a-f]{40}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+// Gateway identities are artifact IDs, not UUIDs. Org/model IDs remain UUIDs.
+export function isExperientialIdentityId(value: string): boolean {
+  return value.length <= 128 && /^[a-z][a-z0-9]*([._-][a-z0-9]+)*$/.test(value);
+}
 
 export class MigrationCheckError extends Error {
   constructor(public readonly code: string, public readonly status?: number) {
@@ -81,13 +87,54 @@ export async function inspectExperientialAccount(key: string, sourceModels: stri
   };
 }
 
+export async function verifyExperientialCanonicalModel(managementKey: string, model: string, canonicalUuid: string, fetcher: Fetcher) {
+  if (!UUID.test(canonicalUuid) || !/^(gpt-|claude-)[a-z0-9.-]+$/.test(model)) throw new MigrationCheckError('exact_model_mapping_required');
+  const detail = await read(managementKey, `/api/models/${encodeURIComponent(model)}`, fetcher);
+  if (detail.model?.id !== canonicalUuid || detail.model?.slug !== model) {
+    throw new MigrationCheckError('canonical_model_mapping_mismatch');
+  }
+}
+
+// Requires the identity-proof extension to /api/whoami. Older deployments fail
+// closed instead of treating organization membership as customer isolation.
+export async function verifyExperientialCustomerKey(key: string, orgId: string, identityId: string, model: string, fetcher: Fetcher) {
+  if (!UUID.test(orgId) || !isExperientialIdentityId(identityId)) throw new MigrationCheckError('invalid_customer_identity');
+  const who = await read(key, '/api/whoami', fetcher);
+  if (who.org_id !== orgId || who.identity_id !== identityId || who.customer_plan_identity_id !== identityId || who.is_provisioning !== false) {
+    throw new MigrationCheckError('identity_bound_customer_key_required');
+  }
+  const catalog = await read(key, '/v1/models', fetcher);
+  if (!Array.isArray(catalog.data) || !catalog.data.some((entry: Json) => entry?.id === model)) {
+    throw new MigrationCheckError('model_not_in_authenticated_catalog');
+  }
+}
+
+export async function verifyExperientialCustomerPlan(key: string, orgId: string, identityId: string,
+  expected: { plan_key: string; plan_version: number; revision: number }, fetcher: Fetcher) {
+  if (!UUID.test(orgId) || !isExperientialIdentityId(identityId) ||
+      !expected || !/^[a-z][a-z0-9_-]{0,63}$/.test(expected.plan_key) ||
+      !Number.isSafeInteger(expected.plan_version) || expected.plan_version < 1 ||
+      !Number.isSafeInteger(expected.revision) || expected.revision < 1) {
+    throw new MigrationCheckError('expected_customer_plan_required');
+  }
+  const assignment = await read(key, `/api/orgs/${orgId}/identities/${encodeURIComponent(identityId)}/customer-plan`, fetcher);
+  if (assignment.org_id !== orgId || assignment.identity_id !== identityId ||
+      assignment.plan_key !== expected.plan_key || assignment.plan_version !== expected.plan_version || assignment.revision !== expected.revision ||
+      assignment.pending_plan_key !== null || assignment.pending_plan_version !== null || assignment.pending_effective_at !== null) {
+    throw new MigrationCheckError('customer_plan_assignment_stale_or_pending');
+  }
+}
+
 const PROMPT = 'Reply with OK.';
 const tool = { type: 'function', function: { name: 'confirm', description: 'Return confirmation.',
   parameters: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'], additionalProperties: false } } };
 
 export function syntheticRequest(model: string, protocol: ProbeProtocol): { path: string; body: Json } {
   // Excludes aliases, auto, confidential/custom, audio and background rescue routes.
-  if (!/^(gpt-[a-z0-9.-]+|claude-[a-z0-9.-]+)$/.test(model)) throw new MigrationCheckError('unsupported_probe_model');
+  if (!getHostedAiAllowedModels('business').includes(model) || !/^(gpt-|claude-)/.test(model)) {
+    throw new MigrationCheckError('unsupported_probe_model');
+  }
+  if (model === 'gpt-6-astra' && protocol !== 'responses') throw new MigrationCheckError('astra_requires_responses');
   if (protocol === 'messages') {
     if (!model.startsWith('claude-')) throw new MigrationCheckError('messages_requires_claude');
     return { path: '/v1/messages', body: { model, max_tokens: 64, messages: [{ role: 'user', content: PROMPT }] } };
@@ -95,7 +142,8 @@ export function syntheticRequest(model: string, protocol: ProbeProtocol): { path
   if (protocol === 'responses') {
     if (model !== 'gpt-6-astra') throw new MigrationCheckError('responses_probe_requires_astra');
     return { path: '/v1/responses', body: { model, input: [{ role: 'user', content: PROMPT }],
-      max_output_tokens: 64, reasoning: { effort: 'low' }, service_tier: 'standard', store: false } };
+      // OpenAI's wire value `default` means the Standard tier.
+      max_output_tokens: 64, reasoning: { effort: 'low' }, service_tier: 'default', store: false } };
   }
   if (!['chat', 'stream', 'tools', 'json-schema'].includes(protocol)) throw new MigrationCheckError('unsupported_protocol');
   const body: Json = { model, messages: [{ role: 'user', content: PROMPT }], max_completion_tokens: 64 };
@@ -110,11 +158,14 @@ export function syntheticRequest(model: string, protocol: ProbeProtocol): { path
 function validateCompletion(data: Json, protocol: ProbeProtocol): void {
   if (data.error) throw new MigrationCheckError('upstream_error_in_success_body');
   if (protocol === 'responses') {
-    if (data.status !== 'completed' || !Array.isArray(data.output) || data.output.length === 0) {
+    if (data.status !== 'completed' || !Array.isArray(data.output) || !data.output.some((item: Json) =>
+      item?.type === 'message' && Array.isArray(item.content) && item.content.some((part: Json) =>
+        part?.type === 'output_text' && typeof part.text === 'string' && part.text.trim()))) {
       throw new MigrationCheckError('responses_not_completed');
     }
   } else if (protocol === 'messages') {
-    if (!Array.isArray(data.content) || data.content.length === 0 || !data.stop_reason) {
+    if (data.stop_reason !== 'end_turn' || !Array.isArray(data.content) || !data.content.some((part: Json) =>
+      part?.type === 'text' && typeof part.text === 'string' && part.text.trim())) {
       throw new MigrationCheckError('messages_not_completed');
     }
   } else {
